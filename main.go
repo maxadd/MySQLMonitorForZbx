@@ -11,9 +11,9 @@ import (
 	"net"
 	"os"
 
+	"context"
 	"flag"
 	"github.com/golang/glog"
-	"golang.org/x/net/context"
 	"strings"
 	"time"
 )
