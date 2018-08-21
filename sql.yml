@@ -1,0 +1,14 @@
+10.2.2.2:
+  zbx_addr: 10.3.3.3:10051
+  instances:
+    3306:
+      user: hehe
+      password: abc@123
+      database: 666
+      _sql:
+        # 由于主从监控会产生多个指标，因此会有多个 key
+        slave.sql[3306]::slave.running[3306]::behind.master[3306]:
+          sql: show slave status
+          frequency: 30
+          flag: m/s
+          items: Slave_IO_Running::Slave_SQL_Running::Seconds_Behind_Master
