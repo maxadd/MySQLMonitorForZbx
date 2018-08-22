@@ -149,28 +149,30 @@ func createMysqlConn(ip, port, user, password, database string) *sql.DB {
 	return db
 }
 
-func genMetric(value, mysqlIP, key, zbxAddr string) {
+func genMetric(value, mysqlIP, key string) *zbxBody {
 	t := time.Now().Unix()
-	a := &zbxBody{
+	return &zbxBody{
 		Host:  mysqlIP,
 		Key:   key,
 		Value: value,
 		Clock: t,
 	}
-	glog.V(2).Infof("Metric: %v", a)
-	valueChan <- &bodyAndIP{body: a, ip: zbxAddr}
+	//glog.V(2).Infof("Metric: %v", a)
+	//valueChan <- &bodyAndIP{body: a, ip: zbxAddr}
 }
 
-func slaveStatus(p *allAttr) {
-	subCtx, cancelFunc := context.WithDeadline(ctx, time.Now().Add(time.Second*2))
-	defer cancelFunc()
-	rows, err := p.conn.QueryContext(subCtx, "SHOW SLAVE STATUS")
-	defer rows.Close()
-	if err != nil {
-		glog.Errorf("Exec sql %s failed, %v", p.sql, err)
-		Exit(1)
+func (p *allAttr) normalQuery(rows *sql.Rows) {
+	var value string
+	for rows.Next() {
+		rows.Scan(&value)
 	}
+	glog.V(2).Infof("exec %s get value: %s", p.sql, value)
+	a := genMetric(value, p.mysqlIP, p.key)
+	valueChan <- &bodyAndIP{body: a, ip: p.zbxAddr}
 
+}
+
+func (p *allAttr) slaveStatus(rows *sql.Rows) {
 	keys := strings.Split(p.key, "::")
 	glog.V(3).Info("master/slave keys: %s", keys)
 	if len(keys) == 0 {
@@ -211,38 +213,51 @@ func slaveStatus(p *allAttr) {
 	for k, col := range data {
 		for n, v := range items {
 			if cols[k] == v {
-				genMetric(col, p.mysqlIP, keys[n], p.zbxAddr)
+				a := genMetric(col, p.mysqlIP, keys[n])
+				valueChan <- &bodyAndIP{body: a, ip: p.zbxAddr}
 				break
 			}
 		}
 	}
 }
 
-func getSQLValue(p *allAttr) {
+func (p *allAttr) getSQLValue() {
+	subCtx, cancelFunc := context.WithDeadline(ctx, time.Now().Add(time.Second*2))
+	defer cancelFunc()
+	rows, err := p.conn.QueryContext(subCtx, p.sql)
+	if err != nil {
+		glog.Errorf("Exec sql %s failed, %v", p.sql, err)
+		Exit(1)
+	}
+	defer rows.Close()
 	switch p.flag {
+	case "", "normal":
+		p.normalQuery(rows)
 	case "m/s":
-		slaveStatus(p)
+		p.slaveStatus(rows)
 	}
 }
 
-func execSQL(p *allAttr) {
+func (p *allAttr) execSQL() {
 	t := time.NewTicker(time.Duration(p.frequency) * time.Second)
 	go func() {
 		for {
-			_ = <-t.C
-			glog.V(1).Infof("start exec sql %s", p.key)
-			getSQLValue(p)
+			select {
+			case _ = <-t.C:
+				glog.V(1).Infof("start exec sql %s", p.key)
+				p.getSQLValue()
+			}
 		}
 	}()
 }
 
-func getLLDMsg(data *lowLevelDiscovery, mysqlIP, key, zbxAddr string) {
+func getLLDMsg(data *lowLevelDiscovery, mysqlIP, key string) *zbxBody {
 	b, err := json.MarshalIndent(data, "", "    ")
 	if err != nil {
 		glog.Errorf("Get LLD json msg failed, %v", err)
 		Exit(1)
 	}
-	genMetric(string(b), mysqlIP, key, zbxAddr)
+	return genMetric(string(b), mysqlIP, key)
 }
 
 func parseMap() {
@@ -251,7 +266,7 @@ func parseMap() {
 		for port, mysqlConf := range v.Instances {
 			conn := createMysqlConn(mysqlIP, port, mysqlConf.User, mysqlConf.Password, mysqlConf.Database)
 			for key, _sql := range mysqlConf.SQL {
-				p := &allAttr{
+				p := allAttr{
 					zbxAddr:   v.ZbxAddr,
 					mysqlIP:   mysqlIP,
 					key:       key,
@@ -262,12 +277,13 @@ func parseMap() {
 					mysqlPort: port,
 					items:     _sql.Items,
 				}
-				execSQL(p)
+				p.execSQL()
 				time.Sleep(2 * time.Second)
 			}
 			discovery.Data = append(discovery.Data, map[string]string{"{#PORT}": port})
 		}
-		getLLDMsg(&discovery, mysqlIP, "db.instance", v.ZbxAddr)
+		a := getLLDMsg(&discovery, mysqlIP, "db.instance")
+		valueChan <- &bodyAndIP{body: a, ip: v.ZbxAddr}
 	}
 }
 
