@@ -10,7 +10,9 @@
 
 由于该脚本支持多实例，可能存在一台机器跑五六个实例的情况，如果一个个的创建这些 key 会显得很麻烦，因此该脚本本身就是基于低级发现（Low Level Discovery）的，你需要创建一个自动发现的监控项（类型同样是 zabbix 采集器），通过不同端口区别多实例。变量名称为 `{#PORT}`。
 
-## SQL 配置
+## 配置文件
+
+用于监控的 SQL 通过配置文件指定，由于存在主从监控、低级发现监控以及普通的监控，它们的配置会有一些差别，但是无论针对哪种，以下配置都是一样的：
 
 ```yml
 10.2.2.2: # mysql ip
@@ -22,40 +24,64 @@
       user: hehe
       password: abc@123
       database: 666
+      # 在这个下面配置 SQL 相关内容
+      _sql: ...
+    3307:
+      user: hehe
+      password: abc@123
+      database: 666
+      _sql: ...
+10.2.2.3: ...
+```
+
+## 主从监控
+
+一般而言，一条 SQL 语句只会产出一个值。但是 `show slave status` 会输出很多列，并且根据 MySQL 版本的不同，列数也不同。也就是说执行普通的 SQL 语句，只会产生一个值，这种情况非常好处理，但是主从监控就比较麻烦了，它会输出多个值，并且每个公司关注的列都可能不一样。并且有些列的值类型是字符串，有些则是数字，这样还无法通过低级发现来创建监控项，因为低级发现生成的监控项必须是同一种类型。
+
+由于存在多实例，所以主从监控必须用到低级发现。低级发现的原理这里就不赘述了，首先直接创建一条自动发现规则：
+
+![](https://github.com/maxadd/MySQLMonitorForZbx/blob/master/images/ms_01.png)
+
+通过这个规则还生成多个实例的主从监控，如果你不是多实例，也不影响。然后就要创建这个规则的监控项原型了，你要关注 `show slave status` 输出的哪些列，就建几个监控项原型（需要注意值的类型）。拿我们公司关注的 `Slave_IO_Running`、`Slave_SQL_Running` 和 `Seconds_Behind_Master` 其中的 `Slave_IO_Running` 举例：
+
+![](https://github.com/maxadd/MySQLMonitorForZbx/blob/master/images/ms_02.png)
+
+`{#PORT}` 这个变量是写死的，通过它来生成多实例。key 的第一个参数是固定的，第二个参数就是你要关注的列，它必须和列名一致。需要注意的是，第一个参数没有使用引号，第二个参数用了引号，请都按照这个标准来，否则发送会失败。至于 key 的名字（这里是 ms.monitor）是可以自定义的。剩下要关注的列按照这种方式继续添加即可。模板建好，套在对应的主机上后，就可以修改配置文件了：
+
+```yml
+10.2.2.2:
+  zbx_addr: 10.3.3.3:10051
+  instances:
+    3306:
+      user: hehe
+      password: abc@123
+      database: 666
       _sql:
-        # 这是对应的 zabbix key，这是主从和低级发现的，所以显得复杂，下面会提到
-        slave.sql[3306]::slave.running[3306]::behind.master[3306]:
+        # 这是低级发现的 key
+        db.instance:
           # 执行的 SQL 语句
           sql: show slave status
           # 多久执行一次，单位是秒
           frequency: 30
           # 表示这是主从监控，另外还有 lld 和 normal 两种
           flag: m/s
-          # 主从监控特有，需要关注哪些列
+          # 对于主从监控，它表示需要关注哪些列，多个列之间使用双冒号分隔
+          # 这里有几项，监控项原型就需要有几个，它们需要一一对应
           items: Slave_IO_Running::Slave_SQL_Running::Seconds_Behind_Master
+          # 监控项原型的 key
+          pt_key: ms.monitor
+    3307:
+      user: hehe
+      password: abc@123
+      database: 666
+      _sql:
+        db.instance:
+          sql: show slave status
+          frequency: 30
+          flag: m/s
+          items: Slave_IO_Running::Slave_SQL_Running::Seconds_Behind_Master
+          pt_key: ms.monitor
 ```
-
-这里只列出了主从同步的监控，因为它最复杂。一般而言，一条 SQL 语句只会产出一个值。但是主从同步会输出很多列，根据 MySQL 版本的不同，列数也不同。我们公司关注 `Slave_IO_Running`、`Slave_SQL_Running`、`Seconds_Behind_Master` 这三个指标。这样一来，就需要三个监控项来接收这三个值。所以 key 就不能只是一个，而写成下面这样就太丑了，而且不利于解析：
-
-```yml
-slave.sql[3306]:
-  sql: show slave status
-  frequency: 30
-  flag: m/s
-  items: Slave_IO_Running
-slave.running[3306]:
-  sql: show slave status
-  frequency: 30
-  flag: m/s
-  items: Slave_SQL_Running
-behind.master[3306]:
-  sql: show slave status
-  frequency: 30
-  flag: m/s
-  items: Seconds_Behind_Master
-```
-
-因此，干脆就将所有的 key 写成一行，它们之间使用 `::` 分隔。而有些公司关注的列不同，并不只限于我们公司使用的这三列，因此提供 items 字段定义需要监控的列，它们之间同样使用 `::` 分隔。正因为如此，使用 `::` 分割后，key 和 items 必须一一对应。
 
 ## 低级发现
 
@@ -97,18 +123,19 @@ zabbix 监控项只支持一对一，这时要想监控这些值就只能将 SQL
           sql: xxx
           frequency: 30
           flag: lld # flag 不要错了
-          items: lld01 # 监控项原型的 key，中括号及其内容不要写
+          pt_key: lld01 # 监控项原型的 key，中括号及其内容不要写
 ```
 
 ## 正常执行
 
-正常监控就是一对一的：
+正常监控就是一对一的，也是最简单的：
 
 ```yml
 _sql:
   key1:
     sql: select xxx
     frequency: 30
+    # 可以不写，默认就是 normal
     flag: normal
 ```
 
