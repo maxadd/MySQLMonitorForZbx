@@ -210,4 +210,3 @@ Usage of /root/mysqlMonitor:
 - `-stderrthreshold`：什么级别的日志会输出到标准错误输出，默认为 error，也就是所有 error 级别的日志都会输出到标准错误输出；
 - `-v`：指定 debug 级别，默认为 0，不会输出。
 
-需要添加的参数有：http 端口、数据库连接池大小、连接池空闲连接大小。
