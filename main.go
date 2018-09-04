@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/binary"
 	"encoding/json"
@@ -11,7 +12,6 @@ import (
 	"net"
 	"os"
 
-	"context"
 	"flag"
 	"github.com/golang/glog"
 	"strings"
@@ -19,23 +19,45 @@ import (
 )
 
 var (
-	allSqlConfig map[string]hostAndSQL
-	valueChan    chan *bodyAndIP
-	bootTime     int64
-	ctx          context.Context
+	allSqlConfig  map[string]hostAndSQL
+	valueChan     chan *bodyAndIP
+	bootTime      int64
+	httpPort      string
+	maxMysqlPool  int
+	idleMysqlPool int
+	msChan        chan *bodyAndIP
+	notifyChan    chan bool
+	sqlChan       chan allAttr
 )
 
 func init() {
 	bootTime = time.Now().Unix()
-	ctx = context.Background()
+	notifyChan = make(chan bool, 1)
+	sqlChan = make(chan allAttr, 10000)
+	valueChan = make(chan *bodyAndIP, 50)
+	msChan = make(chan *bodyAndIP, 2)
+	go startHttpServer()
+	go getPendingExecSql()
+	go waitMetricToSend()
+	go getLLDMsgFromChan()
 }
 
 func getConfigFile() string {
 	var file string
+	flag.IntVar(&maxMysqlPool, "maxpool", 3, "mysql connection pool size")
+	flag.IntVar(&idleMysqlPool, "idlepool", 3, "mysql connection pool maximum idle connection, it should be less than or equal to maxpool")
 	flag.StringVar(&file, "f", "", "config file")
+	flag.StringVar(&httpPort, "p", "1025", "program-initiated http port for providing monitoring data and interacting with the program")
+	//flag.StringVar(&lldKey, "k", "", "zabbix low-level discovery key for mysql multi-instance monitoring")
 	flag.Parse()
+
+	var t []string
 	if file == "" {
-		fmt.Fprintf(os.Stderr, "Usage: %s -f CONFIG_NAME\n", os.Args[0])
+		t = append(t, "-f")
+	}
+
+	if len(t) > 0 {
+		fmt.Fprintf(os.Stderr, "Missing required options: %s\n", strings.Join(t, ", "))
 		os.Exit(1)
 	}
 	return file
@@ -58,6 +80,7 @@ type sqlConfig struct {
 	Frequency int    `yaml:"frequency"`
 	Flag      string `yaml:"flag"`
 	Items     string `yaml:"items"`
+	PtKey     string `yaml:"pt_key"`
 }
 
 type jsonContent struct {
@@ -88,6 +111,7 @@ type allAttr struct {
 	conn      *sql.DB
 	flag      string
 	items     string
+	ptKey     string
 }
 
 type lowLevelDiscovery struct {
@@ -100,27 +124,27 @@ func Exit(code int) {
 }
 
 func getSendData(sendData *jsonContent) []byte {
-	bytes, e := json.Marshal(sendData)
+	b, e := json.Marshal(sendData)
 	if e != nil {
 		glog.Errorf("Marshal failed, %v\n", e)
 		Exit(1)
 	}
 
 	dataLen := make([]byte, 8)
-	binary.LittleEndian.PutUint32(dataLen, uint32(len(bytes)))
+	binary.LittleEndian.PutUint32(dataLen, uint32(len(b)))
 	data := append([]byte("ZBXD\x01"), dataLen...)
-	data = append(data, bytes...)
+	data = append(data, b...)
 	glog.V(1).Infof("the content sent to zabbix is %s", data)
 	return data
 }
 
 func loadYaml(yamlFile string) {
-	bytes, err := ioutil.ReadFile(yamlFile)
+	b, err := ioutil.ReadFile(yamlFile)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "open yaml %s failed, %v\n", yamlFile, err)
 		os.Exit(1)
 	}
-	err = yaml.Unmarshal(bytes, &allSqlConfig)
+	err = yaml.Unmarshal(b, &allSqlConfig)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "parse yaml %s failed, %v\n", yamlFile, err)
 		os.Exit(1)
@@ -149,18 +173,6 @@ func createMysqlConn(ip, port, user, password, database string) *sql.DB {
 	return db
 }
 
-func genMetric(value, mysqlIP, key string) *zbxBody {
-	t := time.Now().Unix()
-	return &zbxBody{
-		Host:  mysqlIP,
-		Key:   key,
-		Value: value,
-		Clock: t,
-	}
-	//glog.V(2).Infof("Metric: %v", a)
-	//valueChan <- &bodyAndIP{body: a, ip: zbxAddr}
-}
-
 func (p *allAttr) normalQuery(rows *sql.Rows) {
 	var value string
 	for rows.Next() {
@@ -173,34 +185,41 @@ func (p *allAttr) normalQuery(rows *sql.Rows) {
 }
 
 func (p *allAttr) slaveStatus(rows *sql.Rows) {
-	keys := strings.Split(p.key, "::")
-	glog.V(3).Info("master/slave keys: %s", keys)
-	if len(keys) == 0 {
-		glog.Errorf("Error in key `%s -> %s -> _sql -> %s` in configuration file",
+	if p.ptKey == "" {
+		glog.Errorf("Missing configuration items under %s/%s/%s of configuration file",
 			p.mysqlIP, p.mysqlPort, p.key)
 		Exit(1)
 	}
+	//keys := strings.Split(p.key, "::")
+	//glog.V(3).Info("master/slave keys: %s", keys)
+	//if len(keys) == 0 {
+	//	glog.Errorf("Error in key `%s -> %s -> _sql -> %s` in configuration file",
+	//		p.mysqlIP, p.mysqlPort, p.key)
+	//	Exit(1)
+	//}
 
 	items := strings.Split(p.items, "::")
 	glog.V(3).Info("master/slave items: %s", items)
-	if len(items) == 0 {
-		glog.Errorf("Error in items `%s -> %s -> _sql -> %s -> %s` in configuration file",
-			p.mysqlIP, p.mysqlPort, p.key, p.items)
-		Exit(1)
-	}
-	if len(keys) != len(items) {
-		glog.Errorf("Items and keys Must correspond one by one in `%s -> %s -> _sql`",
-			p.mysqlIP, p.mysqlPort)
-		Exit(1)
-	}
+	//if len(keys) == 0 {
+	//	glog.Errorf("Error in items `%s -> %s -> _sql -> %s` in configuration file",
+	//		p.mysqlIP, p.mysqlPort, p.key)
+	//	Exit(1)
+	//}
+	//if len(keys) != len(items) {
+	//	glog.Errorf("Items and keys Must correspond one by one in `%s -> %s -> _sql`",
+	//		p.mysqlIP, p.mysqlPort)
+	//	Exit(1)
+	//}
 
+	// cols 里面都是字段名
 	cols, err := rows.Columns()
 	if err != nil {
-		glog.Errorf("Get columns,", err)
+		glog.Errorf("Get columns failed,", err)
 		Exit(1)
 	}
 
 	buff := make([]interface{}, len(cols))
+	// 存储每字段的值
 	data := make([]string, len(cols))
 	for i := range buff {
 		buff[i] = &data[i]
@@ -209,24 +228,54 @@ func (p *allAttr) slaveStatus(rows *sql.Rows) {
 		rows.Scan(buff...)
 	}
 
-	// k 是索引，col 是值
+	// k 是索引，col 是字段对应的值
 	for k, col := range data {
-		for n, v := range items {
+		for _, v := range items {
 			if cols[k] == v {
-				a := genMetric(col, p.mysqlIP, keys[n])
+				a := genMetric(col, p.mysqlIP, p.ptKey+"["+p.mysqlPort+`, "`+v+`"]`)
+				//a := genMetric(col, p.mysqlIP, lldKey+"["+p.mysqlPort+", \""+keys[n]+"\"]")
 				valueChan <- &bodyAndIP{body: a, ip: p.zbxAddr}
 				break
 			}
 		}
 	}
+
+	//for k, col := range data {
+	//	for n, v := range keys {
+	//		if cols[k] == v {
+	//			a := genMetric(col, p.mysqlIP, keys[n]+"["+p.mysqlPort+"]")
+	//			//a := genMetric(col, p.mysqlIP, lldKey+"["+p.mysqlPort+", \""+keys[n]+"\"]")
+	//			valueChan <- &bodyAndIP{body: a, ip: p.zbxAddr}
+	//			break
+	//		}
+	//	}
+	//}
+}
+
+func (p *allAttr) lldQuery(rows *sql.Rows) {
+	if p.ptKey == "" {
+		glog.Error("Missing configuration items under %s/%s/%s of configuration file",
+			p.mysqlIP, p.mysqlPort, p.key)
+		Exit(1)
+	}
+
+	var v1, v2, str string
+	for rows.Next() {
+		rows.Scan(&v1, &v2)
+		a := genMetric(v2, p.mysqlIP, p.ptKey+"["+p.mysqlPort+`, "`+v2+`"]`)
+		valueChan <- &bodyAndIP{body: a, ip: p.zbxAddr}
+		str += v1 + " " + v2
+	}
+	glog.V(2).Infof("exec %s get value: %s", p.sql, str)
+
 }
 
 func (p *allAttr) getSQLValue() {
-	subCtx, cancelFunc := context.WithDeadline(ctx, time.Now().Add(time.Second*2))
-	defer cancelFunc()
-	rows, err := p.conn.QueryContext(subCtx, p.sql)
+	//subCtx, cancelFunc := context.WithDeadline(ctx, time.Now().Add(time.Second*2))
+	//defer cancelFunc()
+	rows, err := p.conn.Query(p.sql)
 	if err != nil {
-		glog.Errorf("Exec sql %s failed, %v", p.sql, err)
+		glog.Errorf("Exec sql %s failed on %s %s, %v", p.sql, p.mysqlIP, p.mysqlPort, err)
 		Exit(1)
 	}
 	defer rows.Close()
@@ -235,20 +284,44 @@ func (p *allAttr) getSQLValue() {
 		p.normalQuery(rows)
 	case "m/s":
 		p.slaveStatus(rows)
+	case "lld":
+		p.lldQuery(rows)
 	}
 }
 
-func (p *allAttr) execSQL() {
-	t := time.NewTicker(time.Duration(p.frequency) * time.Second)
-	go func() {
-		for {
-			select {
-			case _ = <-t.C:
-				glog.V(1).Infof("start exec sql %s", p.key)
-				p.getSQLValue()
-			}
+func (p allAttr) execSQL(t *time.Ticker) {
+	p.getSQLValue()
+	for {
+		select {
+		case _ = <-t.C:
+			glog.V(1).Infof(fmt.Sprintf("start exec sql %s %s %s", p.mysqlIP, p.mysqlPort, p.key))
+			p.getSQLValue()
 		}
-	}()
+	}
+}
+
+func getPendingExecSql() {
+	select {
+	case <-notifyChan:
+		glog.Warning("Start exec sql")
+		for obj := range sqlChan {
+			t := time.NewTicker(time.Duration(obj.frequency) * time.Second)
+			go obj.execSQL(t)
+			time.Sleep(time.Second * 2)
+		}
+	}
+}
+
+func genMetric(value, mysqlIP, key string) *zbxBody {
+	t := time.Now().Unix()
+	return &zbxBody{
+		Host:  mysqlIP,
+		Key:   key,
+		Value: value,
+		Clock: t,
+	}
+	//glog.V(2).Infof("Metric: %v", a)
+	//valueChan <- &bodyAndIP{body: a, ip: zbxAddr}
 }
 
 func getLLDMsg(data *lowLevelDiscovery, mysqlIP, key string) *zbxBody {
@@ -262,32 +335,42 @@ func getLLDMsg(data *lowLevelDiscovery, mysqlIP, key string) *zbxBody {
 
 func parseMap() {
 	for mysqlIP, v := range allSqlConfig {
-		discovery := lowLevelDiscovery{}
+		msDiscovery := lowLevelDiscovery{}
 		for port, mysqlConf := range v.Instances {
 			conn := createMysqlConn(mysqlIP, port, mysqlConf.User, mysqlConf.Password, mysqlConf.Database)
-			for key, _sql := range mysqlConf.SQL {
-				p := allAttr{
+			var count uint8
+			for keys, _sql := range mysqlConf.SQL {
+				sqlChan <- allAttr{
 					zbxAddr:   v.ZbxAddr,
 					mysqlIP:   mysqlIP,
-					key:       key,
+					key:       keys,
 					sql:       _sql.SQL,
 					frequency: _sql.Frequency,
 					conn:      conn,
 					flag:      _sql.Flag,
 					mysqlPort: port,
+					ptKey:     _sql.PtKey,
 					items:     _sql.Items,
 				}
-				p.execSQL()
-				time.Sleep(2 * time.Second)
+				if count > 1 {
+					glog.Error("There can only be one master-slave monitoring under one instance")
+					Exit(1)
+				}
+				if _sql.Flag == "m/s" {
+					msDiscovery.Data = append(msDiscovery.Data, map[string]string{"{#PORT}": port})
+					msg := getLLDMsg(&msDiscovery, mysqlIP, keys)
+					msChan <- &bodyAndIP{body: msg, ip: v.ZbxAddr}
+					count++
+				}
 			}
-			discovery.Data = append(discovery.Data, map[string]string{"{#PORT}": port})
 		}
-		a := getLLDMsg(&discovery, mysqlIP, "db.instance")
-		valueChan <- &bodyAndIP{body: a, ip: v.ZbxAddr}
 	}
+	close(sqlChan)
+	close(msChan)
+	//close(notifyChan)
 }
 
-func sendMetricToZbx(ip string, arrayBody []zbxBody) {
+func sendMetricToZbx(ip string, arrayBody []zbxBody) []byte {
 	t := time.Now().Unix()
 	a := &jsonContent{
 		Request: "sender data",
@@ -313,7 +396,7 @@ func sendMetricToZbx(ip string, arrayBody []zbxBody) {
 			resp = resp[n:]
 		}
 	}
-	glog.Info("zabbix response: %s", string(resp))
+	return resp
 }
 
 func buildMsgToSend(tmpMap map[string][]zbxBody) {
@@ -328,16 +411,24 @@ func buildMsgToSend(tmpMap map[string][]zbxBody) {
 				tmpMap[s.ip] = []zbxBody{}
 				tmpMap[s.ip] = append(tmpMap[s.ip], *s.body)
 			}
+
 		default:
-			for ip, bytes := range tmpMap {
-				sendMetricToZbx(ip, bytes)
+			for ip, b := range tmpMap {
+				resp := sendMetricToZbx(ip, b)
+				idx := bytes.Index(resp, []byte("failed:"))
+				if string(resp[idx+8]) != "0" {
+					i := bytes.Index(resp[idx+8:], []byte(";"))
+					glog.Error("There are " + string(resp[idx+8:idx+8+i]) +
+						" keys that failed to send, and the content sent is" +
+						fmt.Sprintf("%v", b))
+				}
 			}
 			return
 		}
 	}
 }
 
-func WaitMetricToSend() {
+func waitMetricToSend() {
 	for {
 		tmpMap := map[string][]zbxBody{}
 		select {
@@ -348,16 +439,40 @@ func WaitMetricToSend() {
 			time.Sleep(4 * time.Second)
 			buildMsgToSend(tmpMap)
 		}
-
 	}
+}
+
+func getLLDMsgFromChan() {
+	for {
+		select {
+		case s := <-msChan:
+			if s == nil {
+				// 只有在低级发现都发送完毕的情况下，才能开始执行 SQL
+				close(notifyChan)
+				return
+			}
+			sendLLDMsg(s)
+		}
+	}
+}
+
+func sendLLDMsg(s *bodyAndIP) {
+	for i := 0; i < 3; i++ {
+		resp := sendMetricToZbx(s.ip, []zbxBody{*s.body})
+		idx := bytes.Index(resp, []byte("failed:"))
+		if string(resp[idx+8]) == "0" {
+			return
+		}
+		glog.Error("Failed to send low-level discovery data")
+		time.Sleep(2)
+		continue
+	}
+	glog.Errorf("Sending three low-level discovery data failed, the program exits, data:", s.body)
+	Exit(1)
 }
 
 func main() {
 	loadYaml(getConfigFile())
-	fmt.Println(allSqlConfig)
-	go startHttpServer()
-	valueChan = make(chan *bodyAndIP, 30)
-	go WaitMetricToSend()
 	parseMap()
 	select {}
 }
