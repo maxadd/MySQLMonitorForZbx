@@ -13,7 +13,7 @@ import (
 	"os"
 
 	"flag"
-	"github.com/golang/glog"
+	"github.com/maxadd/glog"
 	"strings"
 	"time"
 )
